@@ -1,29 +1,53 @@
 import os
 import asyncio
 import aiosqlite
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from dotenv import load_dotenv
+from aiogram.types import Update
 
-load_dotenv()
+# 1. Настройки
+TOKEN = os.getenv("TOKEN")
+WEBHOOK_PATH = f"/bot/{TOKEN}"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") + WEBHOOK_PATH
+ADMIN_PASSWORD = os.getenv("BOT_PASSWORD")
 
-# Состояния
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
 class Form(StatesGroup):
     password = State()
     select_group = State()
     get_text = State()
 
-bot = Bot(token=os.getenv("TOKEN"))
-dp = Dispatcher()
-
-# Инициализация БД
+# 2. Работа с БД
 async def init_db():
     async with aiosqlite.connect("bot_data.db") as db:
         await db.execute("CREATE TABLE IF NOT EXISTS groups (title TEXT, chat_id INTEGER PRIMARY KEY)")
         await db.commit()
+
+# 3. Жизненный цикл FastAPI (заменяет main)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    yield
+    await bot.delete_webhook()
+
+app = FastAPI(lifespan=lifespan) # Вот та самая переменная "app", которую искал Uvicorn
+
+# 4. Эндпоинт для Webhook
+@app.post(WEBHOOK_PATH)
+async def bot_webhook(request: Request):
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+# --- ЛОГИКА БОТА ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -32,7 +56,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(Form.password)
 async def check_pass(message: types.Message, state: FSMContext):
-    if message.text == os.getenv("BOT_PASSWORD"):
+    if message.text == ADMIN_PASSWORD:
         builder = InlineKeyboardBuilder()
         async with aiosqlite.connect("bot_data.db") as db:
             async with db.execute("SELECT title, chat_id FROM groups") as cursor:
@@ -55,7 +79,7 @@ async def reg_group(message: types.Message):
         async with aiosqlite.connect("bot_data.db") as db:
             await db.execute("INSERT OR REPLACE INTO groups VALUES (?, ?)", (message.chat.title, message.chat.id))
             await db.commit()
-        await message.answer(f"✅ Группа '{message.chat.title}' сохранена в БД!")
+        await message.answer(f"✅ Группа '{message.chat.title}' сохранена!")
 
 @dp.callback_query(Form.select_group, F.data.startswith("grp_"))
 async def group_chosen(callback: types.CallbackQuery, state: FSMContext):
@@ -73,10 +97,3 @@ async def post_text(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
     await state.clear()
-
-async def main():
-    await init_db()
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
