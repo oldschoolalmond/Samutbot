@@ -11,60 +11,82 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import Update
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# 1. Загрузка переменных из Railway
 TOKEN = os.getenv("TOKEN")
 ADMIN_PASSWORD = os.getenv("BOT_PASSWORD")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Например: https://your-app.up.railway.app
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = f"/bot/{TOKEN}"
 
-# 2. Инициализация бота и диспетчера
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Состояния для диалога
 class Form(StatesGroup):
     password = State()
     select_group = State()
     get_text = State()
 
-# 3. База данных (SQLite)
 async def init_db():
     async with aiosqlite.connect("bot_data.db") as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS groups (title TEXT, chat_id INTEGER PRIMARY KEY)")
+        # Добавляем колонку thread_id (может быть NULL, если это обычная группа)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS groups (
+                display_name TEXT, 
+                chat_id INTEGER, 
+                thread_id INTEGER,
+                PRIMARY KEY (chat_id, thread_id)
+            )
+        """)
         await db.commit()
 
-# 4. Жизненный цикл FastAPI (установка вебхука)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-    await bot.set_webhook(url=url, drop_pending_updates=True)
-    logging.info(f"Webhook set to: {url}")
+    await bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}", drop_pending_updates=True)
     yield
     await bot.delete_webhook()
 
-# ЭТО ТА САМАЯ ПЕРЕМЕННАЯ, КОТОРУЮ ИЩЕТ UVICORN
 app = FastAPI(lifespan=lifespan)
 
-# 5. Обработка запросов от Telegram
 @app.post(WEBHOOK_PATH)
 async def bot_webhook(request: Request):
     update = Update.model_validate(await request.json(), context={"bot": bot})
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.get("/")
-async def index():
-    return {"status": "bot is running"}
+# --- ЛОГИКА С ТОПИКАМИ ---
 
-# --- ЛОГИКА БОТА ---
+@dp.message(Command("reg"))
+async def reg_group(message: types.Message):
+    if message.chat.type in ["group", "supergroup"]:
+        chat_id = message.chat.id
+        thread_id = message.message_thread_id # ID топика (None если нет тем)
+        
+        # Определяем название для меню
+        group_title = message.chat.title
+        topic_name = ""
+        
+        # Если это форум, пытаемся понять название темы
+        if message.is_topic_message and message.reply_to_message:
+            # В aiogram 3.x информация о топике часто сидит в forum_topic_created или в кастомных полях
+            topic_name = f" | Тема ID: {thread_id}"
+        
+        display_name = f"{group_title}{topic_name}"
+
+        async with aiosqlite.connect("bot_data.db") as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO groups (display_name, chat_id, thread_id) VALUES (?, ?, ?)",
+                (display_name, chat_id, thread_id)
+            )
+            await db.commit()
+        
+        await message.answer(f"✅ Зарегистрировано как: **{display_name}**", parse_mode="Markdown")
+    else:
+        await message.answer("⚠️ Пишите это в группе или топике.")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await message.answer("🔐 Введите пароль для управления ботом:")
+    await message.answer("🔐 Введите пароль:")
     await state.set_state(Form.password)
 
 @dp.message(Form.password)
@@ -72,44 +94,45 @@ async def check_pass(message: types.Message, state: FSMContext):
     if message.text == ADMIN_PASSWORD:
         builder = InlineKeyboardBuilder()
         async with aiosqlite.connect("bot_data.db") as db:
-            async with db.execute("SELECT title, chat_id FROM groups") as cursor:
+            async with db.execute("SELECT display_name, chat_id, thread_id FROM groups") as cursor:
                 async for row in cursor:
-                    builder.row(types.InlineKeyboardButton(text=row[0], callback_data=f"grp_{row[1]}"))
+                    # Кодируем chat_id и thread_id в callback_data
+                    t_id = row[2] if row[2] else 0
+                    builder.row(types.InlineKeyboardButton(
+                        text=row[0], 
+                        callback_data=f"send_{row[1]}_{t_id}"
+                    ))
         
         if not builder.as_markup().inline_keyboard:
-            await message.answer("📍 Список групп пуст.\nДобавьте бота в группу и напишите там /reg")
+            await message.answer("База пуста. Напишите /reg в нужных топиках.")
             await state.clear()
             return
 
-        await message.answer("✅ Доступ разрешен. Выберите группу:", reply_markup=builder.as_markup())
+        await message.answer("Куда отправляем?", reply_markup=builder.as_markup())
         await state.set_state(Form.select_group)
     else:
-        await message.answer("❌ Неверный пароль. Попробуйте еще раз /start")
-        await state.clear()
+        await message.answer("❌ Нет.")
 
-@dp.message(Command("reg"))
-async def reg_group(message: types.Message):
-    if message.chat.type in ["group", "supergroup"]:
-        async with aiosqlite.connect("bot_data.db") as db:
-            await db.execute("INSERT OR REPLACE INTO groups VALUES (?, ?)", (message.chat.title, message.chat.id))
-            await db.commit()
-        await message.answer(f"✅ Группа '{message.chat.title}' успешно добавлена в базу!")
-    else:
-        await message.answer("⚠️ Эту команду нужно писать внутри группы.")
-
-@dp.callback_query(Form.select_group, F.data.startswith("grp_"))
+@dp.callback_query(Form.select_group, F.data.startswith("send_"))
 async def group_chosen(callback: types.CallbackQuery, state: FSMContext):
-    chat_id = callback.data.split("_")[1]
-    await state.update_data(target_id=chat_id)
-    await callback.message.edit_text("📝 Введите текст сообщения для публикации:")
+    parts = callback.data.split("_")
+    chat_id = int(parts[1])
+    thread_id = int(parts[2]) if int(parts[2]) != 0 else None
+    
+    await state.update_data(target_chat_id=chat_id, target_thread_id=thread_id)
+    await callback.message.edit_text("📝 Пишите текст сообщения:")
     await state.set_state(Form.get_text)
 
 @dp.message(Form.get_text)
 async def post_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     try:
-        await bot.send_message(chat_id=data['target_id'], text=message.text)
-        await message.answer("🚀 Сообщение успешно опубликовано!")
+        await bot.send_message(
+            chat_id=data['target_chat_id'],
+            message_thread_id=data['target_thread_id'], # ПУБЛИКАЦИЯ В ТОПИК
+            text=message.text
+        )
+        await message.answer("🚀 Улетело в чат!")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
     await state.clear()
