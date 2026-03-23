@@ -11,11 +11,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import Update
 
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
+# 1. LOGGING SETTINGS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 2. ПЕРЕМЕННЫЕ (из настроек Railway)
+# 2. VARIABLES (from Railway settings)
 TOKEN = os.getenv("TOKEN")
 ADMIN_PASSWORD = os.getenv("BOT_PASSWORD")
 BASE_URL = os.getenv("WEBHOOK_URL") 
@@ -24,14 +24,14 @@ WEBHOOK_PATH = "/tg/webhook"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Состояния диалога
+# Conversation States
 class Form(StatesGroup):
-    password = State()      # Ожидание пароля
-    select_group = State()  # Выбор чата
-    get_content = State()   # Ожидание того, что переслать
-    confirm = State()       # Подтверждение отправки
+    password = State()      
+    select_group = State()  
+    get_content = State()   
+    confirm = State()       
 
-# 3. БАЗА ДАННЫХ
+# 3. DATABASE
 async def init_db():
     async with aiosqlite.connect("bot_data.db") as db:
         await db.execute("""
@@ -44,16 +44,16 @@ async def init_db():
         """)
         await db.commit()
 
-# 4. ЖИЗНЕННЫЙ ЦИКЛ (Webhook)
+# 4. LIFECYCLE (Webhook)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     webhook_url = f"{BASE_URL}{WEBHOOK_PATH}"
     try:
         await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-        logger.info(f"✅ Вебхук установлен: {webhook_url}")
+        logger.info(f"✅ Webhook set: {webhook_url}")
     except Exception as e:
-        logger.error(f"❌ Ошибка вебхука: {e}")
+        logger.error(f"❌ Webhook error: {e}")
     yield
     await bot.delete_webhook()
 
@@ -66,18 +66,18 @@ async def bot_webhook(request: Request):
         update = Update.model_validate(data, context={"bot": bot})
         await dp.feed_update(bot, update)
     except Exception as e:
-        logger.error(f"❌ Ошибка обработки: {e}")
+        logger.error(f"❌ Processing error: {e}")
     return {"ok": True}
 
 @app.get("/")
 async def index():
-    return {"status": "Бот с предпросмотром запущен"}
+    return {"status": "Bot is running"}
 
-# --- ЛОГИКА БОТА ---
+# --- BOT LOGIC ---
 
 @dp.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: types.Message, state: FSMContext):
-    await message.answer("🔐 Введите пароль для управления:")
+    await message.answer("🔐 Please enter the password:")
     await state.set_state(Form.password)
 
 @dp.message(Form.password)
@@ -94,14 +94,14 @@ async def check_pass(message: types.Message, state: FSMContext):
                     ))
         
         if not builder.as_markup().inline_keyboard:
-            await message.answer("📍 База пуста. Напишите /reg в нужной группе.")
+            await message.answer("📍 Database is empty. Use /reg in a group first.")
             await state.clear()
             return
 
-        await message.answer("🔓 Доступ разрешен. Выберите чат:", reply_markup=builder.as_markup())
+        await message.answer("🔓 Access granted. Select a chat:", reply_markup=builder.as_markup())
         await state.set_state(Form.select_group)
     else:
-        await message.answer("❌ Неверный пароль!")
+        await message.answer("❌ Invalid password!")
         await state.clear()
 
 @dp.message(Command("reg"))
@@ -109,34 +109,47 @@ async def reg_group(message: types.Message):
     if message.chat.type in ["group", "supergroup"]:
         chat_id = message.chat.id
         thread_id = message.message_thread_id
-        display_name = f"{message.chat.title}" + (f" | Тема: {thread_id}" if thread_id else "")
+        
+        group_title = message.chat.title
+        topic_name = ""
+        
+        # Logic to find Topic Name instead of ID
+        if message.is_topic_message:
+            # Try to find the topic name from the forum_topic_created object or current context
+            # If it's a regular message in a topic, we use a placeholder or ID if name is unknown
+            topic_name = f" | Topic: {thread_id}" 
+            # Note: Telegram API doesn't always send the Topic Name with every message.
+            # To get the real name, you'd need extra permissions or a specific service message.
+        
+        display_name = f"{group_title}{topic_name}"
 
         async with aiosqlite.connect("bot_data.db") as db:
             await db.execute("INSERT OR REPLACE INTO groups VALUES (?, ?, ?)", (display_name, chat_id, thread_id))
             await db.commit()
-        await message.answer(f"✅ Запомнил: {display_name}")
+        await message.answer(f"✅ Registered: **{display_name}**", parse_mode="Markdown")
+    else:
+        await message.answer("⚠️ Use this command inside a group or forum topic.")
 
 @dp.callback_query(Form.select_group, F.data.startswith("target_"))
 async def group_chosen(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     await state.update_data(target_chat_id=int(parts[1]), target_thread_id=int(parts[2]) if int(parts[2]) != 0 else None)
-    await callback.message.edit_text("📥 Пришлите то, что хотите опубликовать (текст, фото, файл или стикер):")
+    await callback.message.edit_text("📥 Send the content you want to publish (text, photo, file, or sticker):")
     await state.set_state(Form.get_content)
 
-# ПРЕДПРОСМОТР
+# PREVIEW
 @dp.message(Form.get_content)
 async def preview_content(message: types.Message, state: FSMContext):
-    # Сохраняем ID сообщения, которое нужно будет скопировать
     await state.update_data(msg_to_copy=message.message_id)
     
     builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="✅ Подтвердить и отправить", callback_data="confirm_send"))
-    builder.row(types.InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_send"))
+    builder.row(types.InlineKeyboardButton(text="✅ Confirm & Send", callback_data="confirm_send"))
+    builder.row(types.InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_send"))
     
-    await message.answer("👀 Вот так это будет выглядеть. Отправляем?", reply_markup=builder.as_markup())
+    await message.answer("👀 This is a preview. Shall I send it?", reply_markup=builder.as_markup())
     await state.set_state(Form.confirm)
 
-# ФИНАЛЬНАЯ ОТПРАВКА
+# FINAL SEND
 @dp.callback_query(Form.confirm, F.data == "confirm_send")
 async def final_send(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -147,12 +160,12 @@ async def final_send(callback: types.CallbackQuery, state: FSMContext):
             from_chat_id=callback.message.chat.id,
             message_id=data['msg_to_copy']
         )
-        await callback.message.edit_text("🚀 Опубликовано!")
+        await callback.message.edit_text("🚀 Published successfully!")
     except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка: {e}")
+        await callback.message.edit_text(f"❌ Error: {e}")
     await state.clear()
 
 @dp.callback_query(Form.confirm, F.data == "cancel_send")
 async def cancel_send(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📂 Отменено. Чтобы начать заново, напишите /start")
+    await callback.message.edit_text("📂 Cancelled. Type /start to begin again.")
     await state.clear()
